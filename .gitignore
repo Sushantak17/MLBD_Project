@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs & temp
+*.log
+*.tmp
+
+# ML / Big Data (VERY IMPORTANT)
+data/
+mlruns/
+*.parquet
+*.csv
+*.zip
+*.h5
+*.pth
+*.pt
+
+# Models
+models/
+checkpoints/
+*.ckpt
+
+# Docker
+*.env
+
+# OS files
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+*.sqlite3
