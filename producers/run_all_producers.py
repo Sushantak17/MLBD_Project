@@ -25,6 +25,7 @@ import random
 import sys
 import threading
 import time
+import requests
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,8 +42,8 @@ logging.basicConfig(
 # ─── Global config ────────────────────────────────────────────────────────────
 KAFKA_BROKER     = os.getenv("KAFKA_BROKER",     "localhost:9092")
 DATA_DIR         = Path(os.getenv("DATA_DIR",     "data"))
-TRAFFIC_SPEED    = int(os.getenv("TRAFFIC_SPEED",   "100"))
-POLLUTION_SPEED  = int(os.getenv("POLLUTION_SPEED",  "50"))
+TRAFFIC_SPEED    = int(os.getenv("TRAFFIC_SPEED",   "500"))
+POLLUTION_SPEED  = int(os.getenv("POLLUTION_SPEED",  "200"))
 WEATHER_SPEED    = int(os.getenv("WEATHER_SPEED",    "10"))
 NUM_WORKERS      = int(os.getenv("NUM_WORKERS",      "50"))
 MOVE_INTERVAL    = float(os.getenv("MOVE_INTERVAL",  "30"))
@@ -242,77 +243,131 @@ def run_traffic_producer():
 def run_pollution_producer():
     log       = logging.getLogger("pollution-prod ")
     topic     = "pollution_stream"
-    interval  = 1.0 / POLLUTION_SPEED
     data_file = DATA_DIR / "openaq_nyc.csv"
-
-    if not data_file.exists():
-        log.error("Missing %s – skipping pollution producer.", data_file)
-        log.error("Download: https://openaq.org/data/ (NYC, pm25+no2)")
-        return
+    OPENAQ_API_KEY = os.getenv("OPENAQ_API_KEY", "")
 
     producer   = make_producer("pollution-prod")
-    buffer: dict = {}
-    total_sent  = 0
-    start_time  = time.time()
-    w_sent      = 0
-    w_start     = time.time()
+    total_sent = 0
+    start_time = time.time()
 
-    log.info("Starting at %d rows/sec → %s", POLLUTION_SPEED, topic)
+    def pm25_to_aqi(pm):
+        for lo, hi, ilo, ihi in AQI_BP_PM25:
+            if lo <= pm <= hi:
+                return round((ihi-ilo)/(hi-lo)*(pm-lo)+ilo, 1)
+        return min(500.0, round(pm * 2.1, 1))
 
-    while True:
-        with open(data_file, newline="", encoding="utf-8", errors="replace") as fh:
-            reader = csv.DictReader(fh)
-            for idx, row in enumerate(reader):
-                try:
-                    station_id = (row.get("location") or f"NYC-{idx%30:03d}").strip()
-                    parameter  = (row.get("parameter") or "").strip().lower()
-                    value      = float(row.get("value") or "0")
-                    lat        = float(row.get("latitude")  or row.get("lat")  or "40.7128")
-                    lon        = float(row.get("longitude") or row.get("lon")  or "-74.0060")
+    def nearest_zone(lat, lon):
+        best, dist = ALL_ZONES[0], float("inf")
+        for z in ALL_ZONES:
+            p = z[:2]; a,b,c,d = BOROUGH_BOUNDS[p]; i = int(z[3:])-1
+            zlat = round(a+(i//2+.5)*(b-a)/3, 5)
+            zlon = round(c+(i%2+.5)*(d-c)/2,  5)
+            dd = (lat-zlat)**2 + (lon-zlon)**2
+            if dd < dist: dist=dd; best=z
+        return best
 
-                    if station_id not in buffer:
-                        buffer[station_id] = {"pm25": 0.0, "no2": 0.0, "lat": lat, "lon": lon}
+    # ── LIVE MODE ────────────────────────────────────────────────────────────
+    if OPENAQ_API_KEY:
+        log.info("LIVE MODE — OpenAQ API every 30s → %s", topic)
+        while True:
+            try:
+                resp = requests.get(
+                    "https://api.openaq.org/v3/locations",
+                    params={"bbox":"-74.26,40.48,-73.70,40.92",
+                            "limit":100},
+                    headers={"X-API-Key": OPENAQ_API_KEY},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                locations = resp.json().get("results", [])
 
-                    if "pm25" in parameter or "pm2.5" in parameter:
-                        buffer[station_id]["pm25"] = max(0.0, value)
-                    elif "no2" in parameter:
-                        buffer[station_id]["no2"]  = max(0.0, value)
-                    else:
-                        time.sleep(interval)
-                        continue
+                stations = {}
+                for loc in locations:
+                    lid    = str(loc.get("id",""))
+                    coords = loc.get("coordinates") or {}
+                    lat    = float(coords.get("latitude",  0) or 0)
+                    lon    = float(coords.get("longitude", 0) or 0)
+                    if lat == 0: continue
+                    stations[lid] = {"lat":lat,"lon":lon,"pm25":None,"no2":None}
+                    for sensor in loc.get("sensors", []):
+                        param = (sensor.get("parameter") or {}).get("name","").lower()
+                        val   = (sensor.get("latest")    or {}).get("value")
+                        if val is None: continue
+                        if param == "pm25": stations[lid]["pm25"] = float(val)
+                        if param == "no2":  stations[lid]["no2"]  = float(val)
 
-                    e    = buffer[station_id]
-                    aqi  = compute_aqi(e["pm25"], e["no2"])
-                    zone = lat_lon_to_zone(lat, lon, idx)
-
-                    msg = {
-                        "station_id": station_id,
+                sent = 0
+                for lid, s in stations.items():
+                    pm25 = s["pm25"] or 8.0
+                    no2  = s["no2"]  or 15.0
+                    zone = nearest_zone(s["lat"], s["lon"])
+                    msg  = {
+                        "station_id": f"OAQ-{lid}",
                         "zone_id":    zone,
-                        "pm25":       round(e["pm25"], 2),
-                        "no2":        round(e["no2"],  2),
-                        "aqi":        aqi,
+                        "pm25":       round(pm25, 2),
+                        "no2":        round(no2,  2),
+                        "aqi":        pm25_to_aqi(pm25),
                         "timestamp":  datetime.now(timezone.utc).isoformat(),
-                        "lat":        round(lat, 6),
-                        "lon":        round(lon, 6),
+                        "lat": s["lat"], "lon": s["lon"],
+                        "source": "openaq_live",
                     }
-                    producer.produce(topic, key=station_id.encode(),
+                    producer.produce(topic, key=zone.encode(),
                                      value=json.dumps(msg).encode(), callback=delivery_report)
                     producer.poll(0)
-                    total_sent += 1
-                    w_sent     += 1
-                except Exception:
-                    pass
+                    sent += 1; total_sent += 1
+                producer.flush()
+                log.info("[LIVE] %d readings | total: %d | uptime: %.0fs",
+                         sent, total_sent, time.time()-start_time)
+            except Exception as e:
+                log.error("OpenAQ fetch error: %s", e)
+            time.sleep(30)
 
-                elapsed = time.time() - w_start
-                if elapsed >= 5.0:
-                    log.info("%.1f rows/sec | total: %d | uptime: %.0fs",
-                             w_sent / elapsed, total_sent, time.time() - start_time)
-                    w_sent, w_start = 0, time.time()
-
-                time.sleep(interval)
-
-        producer.flush()
-        log.info("CSV loop complete – rewinding (total: %d)", total_sent)
+    # ── CSV FALLBACK MODE ─────────────────────────────────────────────────────
+    else:
+        log.info("CSV MODE (set OPENAQ_API_KEY for live data) → %s", topic)
+        if not data_file.exists():
+            log.error("Missing %s – skipping pollution producer.", data_file)
+            return
+        interval = 1.0 / POLLUTION_SPEED
+        buffer: dict = {}
+        w_sent = 0; w_start = time.time()
+        while True:
+            with open(data_file, newline="", encoding="utf-8", errors="replace") as fh:
+                reader = csv.DictReader(fh)
+                for idx, row in enumerate(reader):
+                    try:
+                        station_id = (row.get("location") or f"NYC-{idx%30:03d}").strip()
+                        parameter  = (row.get("parameter") or "").strip().lower()
+                        value      = float(row.get("value") or "0")
+                        lat        = float(row.get("latitude")  or "40.7128")
+                        lon        = float(row.get("longitude") or "-74.006")
+                        if station_id not in buffer:
+                            buffer[station_id] = {"pm25":0.0,"no2":0.0,"lat":lat,"lon":lon}
+                        if "pm25" in parameter: buffer[station_id]["pm25"] = max(0.0, value)
+                        elif "no2" in parameter: buffer[station_id]["no2"] = max(0.0, value)
+                        else:
+                            time.sleep(interval); continue
+                        e    = buffer[station_id]
+                        zone = nearest_zone(lat, lon)
+                        msg  = {"station_id":station_id,"zone_id":zone,
+                                "pm25":round(e["pm25"],2),"no2":round(e["no2"],2),
+                                "aqi":compute_aqi(e["pm25"],e["no2"]),
+                                "timestamp":datetime.now(timezone.utc).isoformat(),
+                                "lat":round(lat,6),"lon":round(lon,6),"source":"csv_replay"}
+                        producer.produce(topic, key=station_id.encode(),
+                                         value=json.dumps(msg).encode(), callback=delivery_report)
+                        producer.poll(0)
+                        total_sent += 1; w_sent += 1
+                    except Exception:
+                        pass
+                    elapsed = time.time() - w_start
+                    if elapsed >= 5.0:
+                        log.info("%.1f rows/sec | total: %d | uptime: %.0fs",
+                                 w_sent/elapsed, total_sent, time.time()-start_time)
+                        w_sent, w_start = 0, time.time()
+                    time.sleep(interval)
+            producer.flush()
+            log.info("CSV loop complete – rewinding (total: %d)", total_sent)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

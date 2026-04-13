@@ -7,48 +7,45 @@ This avoids the stream-stream join watermark delay that caused empty batches.
 
 """
 
-import json
-import logging
-import os
+import json, logging, math, os, random
+from collections import defaultdict
 from datetime import datetime
 
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    DoubleType, StringType, StructField, StructType,
-)
+from pyspark.sql.types import DoubleType, StringType, StructField, StructType
 
-# ─── Config ──────────────────────────────────────────────────────────────────
+
+# ── Config ────────────────────────────────────────────────────────────────────
 KAFKA_BROKER    = os.getenv("KAFKA_BROKER",    "redpanda:9092")
 CHECKPOINT_BASE = os.getenv("CHECKPOINT_BASE", "/tmp/urbanstream/checkpoints")
 DATALAKE_BASE   = os.getenv("DATALAKE_BASE",   "/tmp/urbanstream/datalake")
-WINDOW_DURATION = os.getenv("WINDOW_DURATION", "1 minutes")
 WATERMARK       = os.getenv("WATERMARK",       "2 minutes")
 REDIS_HOST      = os.getenv("REDIS_HOST",      "redis")
-BASELINE_SPEED  = 40.0   # km/h
+BASELINE_SPEED  = 40.0
+K               = 4      # number of clusters
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [STREAM-PROCESSOR] %(levelname)s %(message)s",
-)
+# Exposure thresholds — tune these to control demo speed
+HIGH_AQI  = float(os.getenv("HIGH_AQI",   "40.0"))  # AQI above this counts as "high"
+WARN_HRS  = float(os.getenv("WARN_HRS",   "0.3"))   # hours in high-AQI → WARNING
+CRIT_HRS  = float(os.getenv("CRIT_HRS",   "0.6"))   # hours in high-AQI → CRITICAL
+
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s [STREAM-PROCESSOR] %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── Redis (optional – dashboard reads from here) ────────────────────────────
+# ── Redis ─────────────────────────────────────────────────────────────────────
 try:
-    import redis as _redis_lib
-    _redis = _redis_lib.Redis(
-        host=REDIS_HOST, port=6379, db=0,
-        socket_timeout=2, decode_responses=True,
-    )
+    import redis as _rl
+    _redis = _rl.Redis(host=REDIS_HOST, port=6379, db=0,
+                       socket_timeout=2, decode_responses=True)
     _redis.ping()
     log.info("Redis connected at %s:6379", REDIS_HOST)
 except Exception as e:
     _redis = None
-    log.warning("Redis not available (%s) – dashboard will use synthetic data", e)
+    log.warning("Redis unavailable: %s", e)
 
-
-# ─── Schemas ─────────────────────────────────────────────────────────────────
-
+# ── Schemas ───────────────────────────────────────────────────────────────────
 TRAFFIC_SCHEMA = StructType([
     StructField("segment_id", StringType()),
     StructField("speed_kmh",  DoubleType()),
@@ -58,7 +55,6 @@ TRAFFIC_SCHEMA = StructType([
     StructField("lat",        DoubleType()),
     StructField("lon",        DoubleType()),
 ])
-
 POLLUTION_SCHEMA = StructType([
     StructField("station_id", StringType()),
     StructField("zone_id",    StringType()),
@@ -69,7 +65,6 @@ POLLUTION_SCHEMA = StructType([
     StructField("lat",        DoubleType()),
     StructField("lon",        DoubleType()),
 ])
-
 WEATHER_SCHEMA = StructType([
     StructField("temperature", DoubleType()),
     StructField("humidity",    DoubleType()),
@@ -77,408 +72,529 @@ WEATHER_SCHEMA = StructType([
     StructField("condition",   StringType()),
     StructField("timestamp",   StringType()),
 ])
-
 WORKER_SCHEMA = StructType([
-    StructField("worker_id",   StringType()),
-    StructField("zone_id",     StringType()),
-    StructField("borough",     StringType()),
-    StructField("timestamp",   StringType()),
+    StructField("worker_id",     StringType()),
+    StructField("zone_id",       StringType()),
+    StructField("borough",       StringType()),
+    StructField("timestamp",     StringType()),
     StructField("mobility_type", StringType()),
 ])
 
+ALL_ZONES = [f"{p}-{i:02d}" for p in ["MN","BK","QN","BX","SI"] for i in range(1,7)]
 
-# ─── SparkSession ─────────────────────────────────────────────────────────────
+# ── In-memory streaming state ─────────────────────────────────────────────────
+_traffic   = {}   # zone_id → {avg_speed, borough}
+_pollution = {}   # zone_id → {avg_aqi, avg_pm25, avg_no2}
+_exposure  = {}   # worker_id → {hours_in_high_aqi, daily_avg_aqi, count, ...}
+# Load previous exposure from disk if it exists (survives Spark restarts)
+_EXPOSURE_FILE = "/tmp/urbanstream/worker_exposure.json"
+try:
+    if os.path.exists(_EXPOSURE_FILE):
+        with open(_EXPOSURE_FILE) as _f:
+            _exposure = json.load(_f)
+        log.info("Loaded exposure state for %d workers from disk", len(_exposure))
+except Exception as _e:
+    log.warning("Could not load exposure file: %s", _e)
+_total     = [0]
 
-def create_spark() -> SparkSession:
-    return (
-        SparkSession.builder
-        .appName("UrbanStream-v2")
-        .config("spark.sql.shuffle.partitions", "4")
-        .config("spark.streaming.stopGracefullyOnShutdown", "true")
-        .getOrCreate()
-    )
+# ═════════════════════════════════════════════════════════════════════════════
+# STREAMING K-MEANS  (MiniBatchKMeans-style, pure Python, no numpy)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Design mirrors sklearn's MiniBatchKMeans.partial_fit:
+#   • Centroids are maintained across batches (persistent state)
+#   • Each batch does ONE pass of mini-batch gradient descent on centroids
+#   • Learning rate decays as 1/(n_batches+1) so early batches have more
+#     influence than later ones — good for non-stationary streams
+#   • 4 features per zone: avg_speed, avg_aqi, avg_pm25, borough_density
+#   • Inertia (sum of squared distances to nearest centroid) is computed
+#     and logged so you can watch the model converge over time
 
+CLUSTER_NAMES = [
+    "Permanently Hazardous",   # rank 0 → highest hazard
+    "Peak Hour Hazardous",     # rank 1
+    "Weather Sensitive",       # rank 2
+    "Safe Corridor",           # rank 3 → lowest hazard
+]
 
-# ─── Kafka reader ─────────────────────────────────────────────────────────────
+# Borough density proxy (population density index 0-1)
+BOROUGH_DENSITY = {"MN": 1.0, "BK": 0.75, "QN": 0.60, "BX": 0.55, "SI": 0.30}
 
-def read_kafka(spark: SparkSession, topic: str, schema: StructType) -> DataFrame:
-    raw = (
-        spark.readStream
-        .format("kafka")
-        .option("kafka.bootstrap.servers", KAFKA_BROKER)
-        .option("subscribe",               topic)
-        .option("startingOffsets",         "latest")
-        .option("failOnDataLoss",          "false")
-        .option("maxOffsetsPerTrigger",    10000)
-        .load()
-    )
-    return (
-        raw.select(
-            F.from_json(F.col("value").cast("string"), schema).alias("d"),
-            F.col("timestamp").alias("kafka_ts"),
+# Streaming KMeans state — persists across all batches
+class StreamingKMeans:
+    """
+    Pure-Python streaming k-means with MiniBatchKMeans-style partial_fit.
+    Features (4D): [norm_speed, norm_aqi, norm_pm25, norm_density]
+    """
+    def __init__(self, k: int = 4):
+        self.k          = k
+        self.centroids  = None   # list of k feature vectors (lists)
+        self.counts     = [0] * k
+        self.n_batches  = 0
+        self.inertia    = float("inf")
+
+    # ── Normalisation helpers (running min/max) ───────────────────────────────
+    _feat_min = [0.0,   0.0,  0.0, 0.0]
+    _feat_max = [80.0, 200.0, 60.0, 1.0]
+
+    def _norm(self, x: list) -> list:
+        return [
+            (x[i] - self._feat_min[i]) / max(1e-9, self._feat_max[i] - self._feat_min[i])
+            for i in range(len(x))
+        ]
+
+    def _update_range(self, X: list) -> None:
+        for i in range(len(self._feat_min)):
+            vals = [row[i] for row in X]
+            self._feat_min[i] = min(self._feat_min[i], min(vals))
+            self._feat_max[i] = max(self._feat_max[i], max(vals))
+
+    # ── Distance ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def _dist(a: list, b: list) -> float:
+        return sum((ai - bi) ** 2 for ai, bi in zip(a, b))
+
+    # ── Assign each point to nearest centroid ─────────────────────────────────
+    def _assign(self, X_norm: list) -> list:
+        labels = []
+        for x in X_norm:
+            best, best_d = 0, float("inf")
+            for j, c in enumerate(self.centroids):
+                d = self._dist(x, c)
+                if d < best_d:
+                    best_d, best = d, j
+            labels.append(best)
+        return labels
+
+    # ── partial_fit: one mini-batch update ───────────────────────────────────
+    def partial_fit(self, X: list) -> list:
+        """
+        X: list of feature vectors (one per zone)
+        Returns: list of cluster indices (one per zone)
+        """
+        if len(X) < self.k:
+            return list(range(len(X)))
+
+        self._update_range(X)
+        X_norm = [self._norm(x) for x in X]
+
+        # Initialise centroids on first batch (k-means++ style: spaced out)
+        if self.centroids is None:
+            self.centroids = []
+            # First centroid: pick point closest to mean
+            mean = [sum(x[i] for x in X_norm) / len(X_norm) for i in range(len(X_norm[0]))]
+            first = min(range(len(X_norm)),
+                        key=lambda i: self._dist(X_norm[i], mean))
+            self.centroids.append(list(X_norm[first]))
+            # Remaining centroids: pick point furthest from existing centroids
+            for _ in range(self.k - 1):
+                dists = [min(self._dist(x, c) for c in self.centroids) for x in X_norm]
+                # Weighted random selection proportional to distance²
+                total = sum(dists)
+                if total < 1e-12:
+                    idx = random.randrange(len(X_norm))
+                else:
+                    r = random.random() * total
+                    cumul = 0.0
+                    idx = len(X_norm) - 1
+                    for i, d in enumerate(dists):
+                        cumul += d
+                        if cumul >= r:
+                            idx = i
+                            break
+                self.centroids.append(list(X_norm[idx]))
+            self.counts = [0] * self.k
+
+        # Assign points to nearest centroid
+        labels = self._assign(X_norm)
+
+        # Mini-batch gradient descent update
+        # Learning rate: η = 1 / (count_j + batch_size_j)
+        # This mirrors sklearn's MiniBatchKMeans update rule
+        batch_counts = defaultdict(int)
+        batch_sums   = defaultdict(lambda: [0.0] * len(X_norm[0]))
+        for x, lbl in zip(X_norm, labels):
+            batch_counts[lbl] += 1
+            for i, v in enumerate(x):
+                batch_sums[lbl][i] += v
+
+        for j in range(self.k):
+            if batch_counts[j] == 0:
+                continue
+            n_j = batch_counts[j]
+            self.counts[j] += n_j
+            # η decays as more data is seen (online learning rate)
+            eta = n_j / self.counts[j]
+            new_c = [batch_sums[j][i] / n_j for i in range(len(self.centroids[j]))]
+            self.centroids[j] = [
+                (1 - eta) * self.centroids[j][i] + eta * new_c[i]
+                for i in range(len(self.centroids[j]))
+            ]
+
+        # Compute inertia (sum of squared distances to assigned centroid)
+        self.inertia = sum(
+            self._dist(X_norm[i], self.centroids[labels[i]])
+            for i in range(len(X_norm))
         )
-        .select("d.*", "kafka_ts")
-        .withColumn(
-            "event_time",
-            F.coalesce(
-                F.to_timestamp(F.col("timestamp")),
-                F.col("kafka_ts"),
-            )
-        )
-    )
+        self.n_batches += 1
+        return labels
+
+    def semantic_labels(self, zones: list, labels: list) -> dict:
+        """
+        Assign semantic names to clusters by hazard rank.
+        Hazard = high AQI feature (idx 1) - speed feature (idx 0) in centroid.
+        Highest hazard → "Permanently Hazardous", lowest → "Safe Corridor".
+        """
+        if self.centroids is None:
+            return {z: "Safe Corridor" for z in zones}
+
+        # Denormalise centroid features for interpretable hazard score
+        def denorm(c):
+            return [
+                c[i] * (self._feat_max[i] - self._feat_min[i]) + self._feat_min[i]
+                for i in range(len(c))
+            ]
+
+        hazard = {}
+        for j, c in enumerate(self.centroids):
+            dc = denorm(c)
+            # hazard = aqi_centroid - speed_centroid  (same logic as your original)
+            hazard[j] = dc[1] - dc[0]
+
+        sorted_clusters = sorted(hazard.keys(), key=lambda x: -hazard[x])
+        name_map = {c: CLUSTER_NAMES[min(i, 3)] for i, c in enumerate(sorted_clusters)}
+        return {z: name_map[lbl] for z, lbl in zip(zones, labels)}
 
 
-# ─── Redis helpers ────────────────────────────────────────────────────────────
+# Singleton model — persists across all foreachBatch calls in this JVM process
+_skm = StreamingKMeans(k=K)
 
-def push_zone_scores(rows: list) -> None:
-    if not _redis or not rows:
+def _warmstart_clusters_from_file() -> None:
+    """Push offline KMeans labels to Redis on startup so dashboard
+    has real cluster data from batch 0, not synthetic fallback."""
+    path = "/opt/spark/jobs/cluster_labels.json"
+    if not _redis or not os.path.exists(path):
         return
     try:
+        with open(path) as f:
+            labels = json.load(f).get("zone_labels", {})
         pipe = _redis.pipeline()
-        for r in rows:
-            key = f"zone_score:{r['zone_id']}"
-            val = json.dumps({
-                "zone_id":    r["zone_id"],
-                "zone_score": round(float(r.get("zone_score") or 0.5), 3),
-                "avg_aqi":    round(float(r.get("avg_aqi")   or 50.0), 1),
-                "avg_speed":  round(float(r.get("avg_speed") or 30.0), 1),
-                "event_type": str(r.get("event_type") or "NORMAL"),
-                "borough":    str(r.get("borough")    or ""),
-            })
-            pipe.set(key, val, ex=300)
+        for zone, name in labels.items():
+            pipe.set(f"cluster:{zone}", name, ex=3600)
         pipe.execute()
-        log.info("[REDIS] Pushed %d zone scores", len(rows))
+        log.info("[SKM] Warm-started %d cluster labels from offline KMeans", len(labels))
     except Exception as e:
-        log.warning("[REDIS] Push failed: %s", e)
+        log.warning("[SKM] Warm-start failed: %s", e)
+
+_warmstart_clusters_from_file()
 
 
-def push_worker_exposure(rows: list) -> None:
-    if not _redis or not rows:
+def _retrain_and_push_clusters(batch_id: int) -> None:
+    """
+    Called after every traffic or pollution batch.
+    Builds feature matrix from current in-memory state,
+    runs partial_fit, pushes updated cluster labels to Redis.
+    """
+    zones = [z for z in ALL_ZONES if z in _traffic or z in _pollution]
+    if len(zones) < K:
+        log.debug("[SKM] Not enough zones yet (%d < %d)", len(zones), K)
         return
+
+    # Build 4-feature matrix: [avg_speed, avg_aqi, avg_pm25, density]
+    X, zone_ids = [], []
+    for z in ALL_ZONES:   # use ALL_ZONES so ordering is stable
+        t = _traffic.get(z,   {"avg_speed": 30.0})
+        p = _pollution.get(z, {"avg_aqi": 50.0, "avg_pm25": 10.0})
+        X.append([
+            t["avg_speed"],
+            p["avg_aqi"],
+            p["avg_pm25"],
+            BOROUGH_DENSITY.get(z[:2], 0.5),
+        ])
+        zone_ids.append(z)
+
+    # ── PARTIAL FIT — this is the streaming retraining every batch ────────────
+    labels = _skm.partial_fit(X)
+
+    # Assign semantic names from centroid hazard ranking
+    zone_clusters = _skm.semantic_labels(zone_ids, labels)
+
+    # Push cluster:{zone_id} → label to Redis (TTL 5 min)
+    if _redis:
+        try:
+            pipe = _redis.pipeline()
+            for z, name in zone_clusters.items():
+                pipe.set(f"cluster:{z}", name, ex=300)
+            pipe.set("skm_batch_count", _skm.n_batches,  ex=3600)
+            pipe.set("skm_inertia",     round(_skm.inertia, 4), ex=3600)
+            pipe.execute()
+        except Exception as e:
+            log.warning("[SKM] Redis push failed: %s", e)
+
+    log.info(
+        "[SKM] Batch #%d | partial_fit #%d | %d zones reclassified | inertia=%.4f",
+        batch_id, _skm.n_batches, len(zone_ids), _skm.inertia
+    )
+
+    # Log cluster composition for visibility
+    by_cluster = defaultdict(list)
+    for z, name in zone_clusters.items():
+        by_cluster[name].append(z)
+    for name, zlist in sorted(by_cluster.items()):
+        log.info("  %-28s → %d zones: %s", name, len(zlist),
+                 ", ".join(sorted(zlist)[:4]) + ("…" if len(zlist) > 4 else ""))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Zone score push  (unchanged from v3)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _push_zone_scores(batch_id: int) -> None:
+    zones = set(list(_traffic.keys()) + list(_pollution.keys()))
+    if not zones:
+        return
+    scores = []
+    for zid in zones:
+        t   = _traffic.get(zid,   {"avg_speed": BASELINE_SPEED, "borough": ""})
+        p   = _pollution.get(zid, {"avg_aqi": 50.0, "avg_pm25": 10.0, "avg_no2": 20.0})
+        spd = t["avg_speed"]; aqi = p["avg_aqi"]
+        ss  = min(1.0, spd / BASELINE_SPEED)
+        aq  = min(1.0, aqi / 100.0)
+        zs  = round(ss * 0.5 + aq * 0.5, 3)
+        cong = spd < BASELINE_SPEED * 0.6; poll = aqi > 150
+        evt  = ("COMPOUND_EVENT"   if cong and poll else
+                "CONGESTION_EVENT" if cong else
+                "POLLUTION_ALERT"  if poll else "NORMAL")
+        scores.append({"zone_id": zid, "avg_speed": round(spd,1),
+                        "avg_aqi": round(aqi,1), "avg_pm25": round(p["avg_pm25"],1),
+                        "zone_score": zs, "event_type": evt,
+                        "borough": t["borough"], "batch_id": batch_id,
+                        "ts": datetime.now().isoformat(timespec="seconds")})
+    if _redis:
+        try:
+            pipe = _redis.pipeline()
+            for s in scores:
+                pipe.set(f"zone_score:{s['zone_id']}", json.dumps(s), ex=300)
+            pipe.execute()
+        except Exception as e:
+            log.warning("[REDIS] zone push failed: %s", e)
+
+    evts = [s for s in scores if s["event_type"] != "NORMAL"]
+    if evts:
+        log.warning("[EVENTS] Batch #%d → %d anomalies: %s",
+                    batch_id, len(evts),
+                    ", ".join(f"{e['zone_id']}:{e['event_type']}" for e in evts[:5]))
+    log.info("[ZONE_SCORES] Batch #%d | %d zones | pushed to Redis", batch_id, len(scores))
+
     try:
-        pipe = _redis.pipeline()
-        for r in rows:
-            key = f"exposure:{r['worker_id']}"
-            val = json.dumps({
-                "worker_id":         r["worker_id"],
-                "zone_id":           r.get("zone_id", ""),
-                "exposure_status":   r.get("exposure_status", "SAFE"),
-                "hours_in_high_aqi": round(float(r.get("hours_in_high_aqi") or 0), 3),
-                "high_aqi_minutes":  round(float(r.get("hours_in_high_aqi") or 0) * 60.0, 3),
-                "total_minutes":     round(float(r.get("count", 1)) * 1.0, 3),
-                "aqi_sum":           round(float(r.get("daily_avg_aqi") or 50) * float(r.get("count", 1)), 1),
-                "daily_avg_aqi":     round(float(r.get("daily_avg_aqi")     or 50), 1),
-            })
-            pipe.set(key, val, ex=300)
-            pipe.set(f"worker_zone:{r['worker_id']}", r.get("zone_id", ""), ex=300)
-        pipe.execute()
-    except Exception as e:
-        log.warning("[REDIS] Worker exposure push failed: %s", e)
+        d = f"{DATALAKE_BASE}/zone_scores/batch_{batch_id:06d}"
+        os.makedirs(d, exist_ok=True)
+        with open(f"{d}/data.json","w") as f:
+            json.dump(scores, f)
+    except Exception:
+        pass
 
 
-# ─── Shared in-memory state (updated each batch) ─────────────────────────────
-# Stores latest per-zone aggregates so zone_scores batch can enrich with AQI
-# even when traffic and pollution arrive in different micro-batches.
+# ═════════════════════════════════════════════════════════════════════════════
+# Kafka reader
+# ═════════════════════════════════════════════════════════════════════════════
 
-_latest_traffic:   dict = {}   # zone_id → {avg_speed, borough}
-_latest_pollution: dict = {}   # zone_id → {avg_aqi, avg_pm25, avg_no2}
-_worker_exposure:  dict = {}   # worker_id → {hours_in_high_aqi, zone_id, ...}
-_total_records = [0]
+def read_kafka(spark, topic, schema):
+    raw = (spark.readStream.format("kafka")
+           .option("kafka.bootstrap.servers", KAFKA_BROKER)
+           .option("subscribe", topic)
+           .option("startingOffsets", "latest")
+           .option("failOnDataLoss", "false")
+           .option("maxOffsetsPerTrigger", 10000)
+           .load())
+    return (raw.select(F.from_json(F.col("value").cast("string"), schema).alias("d"),
+                       F.col("timestamp").alias("kafka_ts"))
+            .select("d.*", "kafka_ts")
+            .withColumn("event_time",
+                F.coalesce(F.to_timestamp("timestamp"), F.col("kafka_ts"))))
 
 
-# ─── foreachBatch handlers ────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# foreachBatch handlers
+# ═════════════════════════════════════════════════════════════════════════════
 
-def handle_traffic(df: DataFrame, batch_id: int) -> None:
+def handle_traffic(df: DataFrame, batch_id: int):
     rows = df.collect()
     if not rows:
         return
-
-    # Aggregate per zone in Python (batch is small)
-    zone_data: dict = {}
+    zone_data = {}
     for r in rows:
         zid = r["zone_id"] or "MN-01"
         spd = float(r["speed_kmh"] or 30)
-        if zid not in zone_data:
-            zone_data[zid] = {"speeds": [], "borough": r["borough"] or "Manhattan"}
-        zone_data[zid]["speeds"].append(spd)
-
+        zone_data.setdefault(zid, {"speeds": [], "borough": r["borough"] or ""})["speeds"].append(spd)
     for zid, d in zone_data.items():
-        avg_spd = sum(d["speeds"]) / len(d["speeds"])
-        _latest_traffic[zid] = {"avg_speed": avg_spd, "borough": d["borough"]}
-
-    _total_records[0] += len(rows)
-    log.info("[TRAFFIC] Batch #%d | %d rows | %d zones updated | total: %d",
-             batch_id, len(rows), len(zone_data), _total_records[0])
-
-    # Recompute and push zone scores after every traffic batch
+        _traffic[zid] = {"avg_speed": sum(d["speeds"]) / len(d["speeds"]),
+                         "borough": d["borough"]}
+    _total[0] += len(rows)
+    log.info("[TRAFFIC] Batch #%d | %d rows | %d zones | total %d",
+             batch_id, len(rows), len(zone_data), _total[0])
+    # ── retrain streaming KMeans every traffic batch ──────────────────────────
+    _retrain_and_push_clusters(batch_id)
     _push_zone_scores(batch_id)
 
 
-def handle_pollution(df: DataFrame, batch_id: int) -> None:
+def handle_pollution(df: DataFrame, batch_id: int):
     rows = df.collect()
     if not rows:
         return
-
-    zone_data: dict = {}
+    zone_data = {}
     for r in rows:
         zid = r["zone_id"] or "MN-01"
-        aqi = float(r["aqi"] or 50)
-        pm  = float(r["pm25"] or 10)
-        no2 = float(r["no2"]  or 20)
-        if zid not in zone_data:
-            zone_data[zid] = {"aqis": [], "pm25s": [], "no2s": []}
-        zone_data[zid]["aqis"].append(aqi)
-        zone_data[zid]["pm25s"].append(pm)
-        zone_data[zid]["no2s"].append(no2)
-
+        zone_data.setdefault(zid, {"aqis": [], "pm25s": [], "no2s": []})
+        zone_data[zid]["aqis"].append(float(r["aqi"] or 50))
+        zone_data[zid]["pm25s"].append(float(r["pm25"] or 10))
+        zone_data[zid]["no2s"].append(float(r["no2"] or 20))
     for zid, d in zone_data.items():
-        _latest_pollution[zid] = {
-            "avg_aqi":  sum(d["aqis"])  / len(d["aqis"]),
-            "avg_pm25": sum(d["pm25s"]) / len(d["pm25s"]),
-            "avg_no2":  sum(d["no2s"])  / len(d["no2s"]),
-        }
-
-    _total_records[0] += len(rows)
-    log.info("[POLLUTION] Batch #%d | %d rows | %d zones updated",
-             batch_id, len(rows), len(zone_data))
-
+        _pollution[zid] = {"avg_aqi":  sum(d["aqis"])  / len(d["aqis"]),
+                           "avg_pm25": sum(d["pm25s"]) / len(d["pm25s"]),
+                           "avg_no2":  sum(d["no2s"])  / len(d["no2s"])}
+    _total[0] += len(rows)
+    log.info("[POLLUTION] Batch #%d | %d rows | %d zones", batch_id, len(rows), len(zone_data))
+    # ── retrain streaming KMeans every pollution batch ────────────────────────
+    _retrain_and_push_clusters(batch_id)
     _push_zone_scores(batch_id)
 
 
-def _push_zone_scores(batch_id: int) -> None:
-    """Merge latest traffic + pollution into zone scores and push to Redis."""
-    all_zones = set(list(_latest_traffic.keys()) + list(_latest_pollution.keys()))
-    if not all_zones:
-        return
-
-    scores = []
-    for zid in all_zones:
-        t = _latest_traffic.get(zid,   {"avg_speed": BASELINE_SPEED, "borough": ""})
-        p = _latest_pollution.get(zid, {"avg_aqi": 50.0, "avg_pm25": 10.0, "avg_no2": 20.0})
-
-        avg_speed = t["avg_speed"]
-        avg_aqi   = p["avg_aqi"]
-
-        speed_score = min(1.0, avg_speed / BASELINE_SPEED)
-        aqi_score   = min(1.0, avg_aqi   / 100.0)
-        zone_score  = round((speed_score * 0.5) + (aqi_score * 0.5), 3)
-
-        congestion = avg_speed < (BASELINE_SPEED * 0.6)
-        pollution  = avg_aqi > 150
-        if congestion and pollution:
-            event = "COMPOUND_EVENT"
-        elif congestion:
-            event = "CONGESTION_EVENT"
-        elif pollution:
-            event = "POLLUTION_ALERT"
-        else:
-            event = "NORMAL"
-
-        scores.append({
-            "zone_id":    zid,
-            "avg_speed":  round(avg_speed, 1),
-            "avg_aqi":    round(avg_aqi, 1),
-            "avg_pm25":   round(p["avg_pm25"], 1),
-            "zone_score": zone_score,
-            "event_type": event,
-            "borough":    t["borough"],
-            "batch_id":   batch_id,
-            "ts":         datetime.now().isoformat(timespec="seconds"),
-        })
-
-    push_zone_scores(scores)
-
-    events = [s for s in scores if s["event_type"] != "NORMAL"]
-    if events:
-        log.warning("[EVENTS] Batch #%d → %d anomalies: %s",
-                    batch_id, len(events),
-                    ", ".join(f"{e['zone_id']}:{e['event_type']}" for e in events[:5]))
-
-    log.info("[ZONE_SCORES] Batch #%d | %d zones scored | pushed to Redis",
-             batch_id, len(scores))
-
-    # Write Parquet snapshot
-    try:
-        import json as _json
-        out_dir = f"{DATALAKE_BASE}/zone_scores/batch_{batch_id:06d}"
-        os.makedirs(out_dir, exist_ok=True)
-        with open(f"{out_dir}/data.json", "w") as f:
-            _json.dump(scores, f)
-    except Exception as e:
-        log.debug("Parquet write skipped: %s", e)
-
-
-def handle_workers(df: DataFrame, batch_id: int) -> None:
+def handle_workers(df: DataFrame, batch_id: int):
     rows = df.collect()
     if not rows:
         return
-
-    HIGH_AQI = 100.0
-    WINDOW_MINS = 1.0  # matches our WINDOW_DURATION
-
     updated = []
     for r in rows:
         wid  = r["worker_id"]
         zid  = r["zone_id"] or "MN-01"
-        aqi  = _latest_pollution.get(zid, {}).get("avg_aqi", 75.0)
-        prev = _worker_exposure.get(wid, {"hours_in_high_aqi": 0.0, "daily_avg_aqi": 0.0, "count": 0})
-
-        new_high_mins = prev["hours_in_high_aqi"] * 60 + (WINDOW_MINS if aqi > HIGH_AQI else 0)
+        aqi  = _pollution.get(zid, {}).get("avg_aqi", 75.0)
+        prev = _exposure.get(wid, {"hours_in_high_aqi": 0.0, "daily_avg_aqi": 0.0, "count": 0})
+        new_high_mins = prev["hours_in_high_aqi"] * 60 + (1.0 if aqi > HIGH_AQI else 0)
         new_count     = prev["count"] + 1
         new_avg_aqi   = (prev["daily_avg_aqi"] * prev["count"] + aqi) / new_count
-        hours_high    = new_high_mins / 60.0
+        hrs_high      = new_high_mins / 60.0
+        status        = ("CRITICAL" if hrs_high > CRIT_HRS else
+                         "WARNING"  if hrs_high > WARN_HRS else "SAFE")
+        _exposure[wid] = {"worker_id": wid, "zone_id": zid,
+                          "hours_in_high_aqi": round(hrs_high, 3),
+                          "daily_avg_aqi":     round(new_avg_aqi, 1),
+                          "exposure_status":   status, "count": new_count}
+        updated.append(_exposure[wid])
 
-        status = "CRITICAL" if hours_high > 3.5 else ("WARNING" if hours_high > 2.0 else "SAFE")
+    # Persist to disk so restarts don't lose accumulated exposure
+    try:
+        os.makedirs("/tmp/urbanstream", exist_ok=True)
+        with open(_EXPOSURE_FILE, "w") as f:
+            json.dump(_exposure, f)
+    except Exception as e:
+        log.warning("Could not save exposure file: %s", e)
+    if _redis:
+        try:
+            pipe = _redis.pipeline()
+            for w in updated:
+                rec = {**w,
+                       "high_aqi_minutes": round(w["hours_in_high_aqi"] * 60, 2),
+                       "total_minutes":    round(w["count"] * 1.0, 1),
+                       "aqi_sum":          round(w["daily_avg_aqi"] * w["count"], 1)}
+                pipe.set(f"exposure:{w['worker_id']}", json.dumps(rec), ex=60)
+                pipe.set(f"worker_zone:{w['worker_id']}", w["zone_id"], ex=300)
+            pipe.execute()
+        except Exception as e:
+            log.warning("[REDIS] worker push failed: %s", e)
+    crit = sum(1 for w in updated if w["exposure_status"] == "CRITICAL")
+    warn = sum(1 for w in updated if w["exposure_status"] == "WARNING")
+    log.info("[WORKERS] Batch #%d | %d workers | Crit:%d Warn:%d",
+             batch_id, len(updated), crit, warn)
 
-        _worker_exposure[wid] = {
-            "worker_id":        wid,
-            "zone_id":          zid,
-            "hours_in_high_aqi": round(hours_high, 3),
-            "daily_avg_aqi":    round(new_avg_aqi, 1),
-            "exposure_status":  status,
-            "count":            new_count,
-        }
-        updated.append(_worker_exposure[wid])
 
-    critical = sum(1 for w in updated if w["exposure_status"] == "CRITICAL")
-    warning  = sum(1 for w in updated if w["exposure_status"] == "WARNING")
-    log.info("[WORKERS] Batch #%d | %d workers | Critical:%d Warning:%d",
-             batch_id, len(updated), critical, warning)
-
-
-def handle_weather(df: DataFrame, batch_id: int) -> None:
+def handle_weather(df: DataFrame, batch_id: int):
     rows = df.collect()
     if not rows:
         return
-    latest = rows[-1]
-    log.info("[WEATHER] Batch #%d | temp=%.1f°C humidity=%.0f%% wind=%.1fkm/h",
-             batch_id,
-             float(latest["temperature"] or 0),
-             float(latest["humidity"]    or 0),
-             float(latest["windspeed"]   or 0))
-
+    r = rows[-1]
+    log.info("[WEATHER] Batch #%d | %.1f°C  %.0f%%  %.1f km/h",
+             batch_id, float(r["temperature"] or 0),
+             float(r["humidity"] or 0), float(r["windspeed"] or 0))
     if _redis:
         try:
             _redis.set("weather_current", json.dumps({
-                "temperature": float(latest["temperature"] or 0),
-                "humidity":    float(latest["humidity"]    or 0),
-                "windspeed":   float(latest["windspeed"]   or 0),
-                "condition":   str(latest["condition"]     or "Clear"),
-                "ts":          datetime.now().isoformat(timespec="seconds"),
-            }), ex=300)
+                "temperature": float(r["temperature"] or 0),
+                "humidity":    float(r["humidity"]    or 0),
+                "windspeed":   float(r["windspeed"]   or 0),
+                "condition":   str(r["condition"]     or "Clear"),
+                "ts":          datetime.now().isoformat(timespec="seconds")}), ex=300)
         except Exception:
             pass
 
 
-def handle_metrics(df: DataFrame, batch_id: int) -> None:
+def handle_metrics(df: DataFrame, batch_id: int):
     count = df.count()
-    _total_records[0] += count
-    log.info("[METRICS] Batch #%d | Batch records: %d | Running total: %d",
-             batch_id, count, _total_records[0])
-
+    _total[0] += count
+    log.info("[METRICS] Batch #%d | %d records | running total: %d",
+             batch_id, count, _total[0])
     if _redis:
         try:
-            _redis.set("perf_total_records", _total_records[0], ex=3600)
-            # Append to throughput history
-            hist_key = "perf_history"
-            entry = json.dumps({
-                "ts":  datetime.now().strftime("%H:%M"),
-                "rps": count,
-                "lag_ms": 50,
-                "storage_mb": _total_records[0] / 1000,
-            })
-            _redis.rpush(hist_key, entry)
-            _redis.ltrim(hist_key, -20, -1)   # keep last 20 entries
-            _redis.expire(hist_key, 3600)
+            _redis.set("perf_total_records", _total[0], ex=3600)
+            entry = json.dumps({"ts":         datetime.now().strftime("%H:%M"),
+                                "rps":        count,
+                                "lag_ms":     50,
+                                "storage_mb": _total[0] / 1000})
+            _redis.rpush("perf_history", entry)
+            _redis.ltrim("perf_history", -20, -1)
+            _redis.expire("perf_history", 3600)
         except Exception:
             pass
 
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# SparkSession + Main
+# ═════════════════════════════════════════════════════════════════════════════
+
+def create_spark():
+    return (SparkSession.builder
+            .appName("UrbanStream-v4")
+            .config("spark.sql.shuffle.partitions", "4")
+            .config("spark.streaming.stopGracefullyOnShutdown", "true")
+            .getOrCreate())
+
 
 def main():
-    log.info("Initializing UrbanStream Spark processor (v2 – no stream-stream join)...")
+    log.info("UrbanStream Spark Processor v4")
+    log.info("  Streaming KMeans: partial_fit every batch, k=%d", K)
+    log.info("  Features: [avg_speed, avg_aqi, avg_pm25, borough_density]")
+    log.info("  Broker=%s  Redis=%s", KAFKA_BROKER, REDIS_HOST)
+
     spark = create_spark()
     spark.sparkContext.setLogLevel("WARN")
 
-    log.info("KAFKA_BROKER    = %s", KAFKA_BROKER)
-    log.info("CHECKPOINT_BASE = %s", CHECKPOINT_BASE)
-    log.info("WINDOW_DURATION = %s", WINDOW_DURATION)
-    log.info("REDIS_HOST      = %s", REDIS_HOST)
+    os.makedirs(CHECKPOINT_BASE, exist_ok=True)
+    os.makedirs(DATALAKE_BASE,   exist_ok=True)
 
-    log.info("Reading Kafka topics...")
     traffic_raw   = read_kafka(spark, "traffic_stream",   TRAFFIC_SCHEMA)
     pollution_raw = read_kafka(spark, "pollution_stream", POLLUTION_SCHEMA)
     weather_raw   = read_kafka(spark, "weather_stream",   WEATHER_SCHEMA)
     worker_raw    = read_kafka(spark, "worker_stream",    WORKER_SCHEMA)
 
-    os.makedirs(CHECKPOINT_BASE, exist_ok=True)
-    os.makedirs(DATALAKE_BASE,   exist_ok=True)
+    def _qs(df, cp, fn):
+        return (df.withWatermark("event_time", WATERMARK)
+                  .writeStream.outputMode("append")
+                  .option("checkpointLocation", cp)
+                  .trigger(processingTime="30 seconds")
+                  .foreachBatch(fn).start())
 
-    log.info("Starting streaming queries (trigger: 30 seconds)...")
+    q1 = _qs(traffic_raw,   f"{CHECKPOINT_BASE}/traffic",   handle_traffic)
+    q2 = _qs(pollution_raw, f"{CHECKPOINT_BASE}/pollution",  handle_pollution)
+    q3 = _qs(weather_raw,   f"{CHECKPOINT_BASE}/weather",    handle_weather)
+    q4 = _qs(worker_raw,    f"{CHECKPOINT_BASE}/workers",    handle_workers)
+    q5 = (traffic_raw.writeStream.outputMode("append")
+          .option("checkpointLocation", f"{CHECKPOINT_BASE}/metrics")
+          .trigger(processingTime="60 seconds")
+          .foreachBatch(handle_metrics).start())
 
-    q_traffic = (
-        traffic_raw
-        .withWatermark("event_time", WATERMARK)
-        .writeStream
-        .outputMode("append")
-        .option("checkpointLocation", f"{CHECKPOINT_BASE}/traffic")
-        .trigger(processingTime="30 seconds")
-        .foreachBatch(handle_traffic)
-        .start()
-    )
-
-    q_pollution = (
-        pollution_raw
-        .withWatermark("event_time", WATERMARK)
-        .writeStream
-        .outputMode("append")
-        .option("checkpointLocation", f"{CHECKPOINT_BASE}/pollution")
-        .trigger(processingTime="30 seconds")
-        .foreachBatch(handle_pollution)
-        .start()
-    )
-
-    q_weather = (
-        weather_raw
-        .withWatermark("event_time", WATERMARK)
-        .writeStream
-        .outputMode("append")
-        .option("checkpointLocation", f"{CHECKPOINT_BASE}/weather")
-        .trigger(processingTime="30 seconds")
-        .foreachBatch(handle_weather)
-        .start()
-    )
-
-    q_workers = (
-        worker_raw
-        .withWatermark("event_time", WATERMARK)
-        .writeStream
-        .outputMode("append")
-        .option("checkpointLocation", f"{CHECKPOINT_BASE}/workers")
-        .trigger(processingTime="30 seconds")
-        .foreachBatch(handle_workers)
-        .start()
-    )
-
-    q_metrics = (
-        traffic_raw
-        .writeStream
-        .outputMode("append")
-        .option("checkpointLocation", f"{CHECKPOINT_BASE}/metrics")
-        .trigger(processingTime="60 seconds")
-        .foreachBatch(handle_metrics)
-        .start()
-    )
-
-    log.info("All 5 streaming queries running.")
-    log.info("  Traffic    : %s", q_traffic.id)
-    log.info("  Pollution  : %s", q_pollution.id)
-    log.info("  Weather    : %s", q_weather.id)
-    log.info("  Workers    : %s", q_workers.id)
-    log.info("  Metrics    : %s", q_metrics.id)
-    log.info("Waiting for data... first batch in ~30 seconds.")
-
+    log.info("All 5 queries running — first batch + cluster update in ~30s")
+    log.info("  traffic=%s  pollution=%s  weather=%s  workers=%s  metrics=%s",
+             q1.id, q2.id, q3.id, q4.id, q5.id)
     spark.streams.awaitAnyTermination()
 
 

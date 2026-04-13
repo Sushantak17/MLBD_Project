@@ -6,7 +6,9 @@ UrbanStream Recommender v3
 - Falls back to deterministic synthetic data (not random-per-cycle)
 """
 import json, logging, os, random, time
+import numpy as np
 from datetime import datetime, timezone
+from collections import deque
 import redis
 
 logging.basicConfig(level=logging.INFO,
@@ -17,9 +19,9 @@ REDIS_HOST   = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT   = int(os.getenv("REDIS_PORT", "6379"))
 RUN_INTERVAL = int(os.getenv("RUN_INTERVAL", "30"))
 NUM_WORKERS  = 50
-HIGH_AQI     = 25.0
-WARN_HRS     = 2.0
-CRIT_HRS     = 3.5
+HIGH_AQI     = 40.0
+WARN_HRS     = 0.3   # WARNING after ~15 min of demo runtime
+CRIT_HRS     = 0.6   # CRITICAL after ~30 min of demo runtime
 
 ALL_ZONES = [f"{p}-{i:02d}" for p in ["MN","BK","QN","BX","SI"] for i in range(1,7)]
 
@@ -30,6 +32,38 @@ CLUSTER_WEIGHTS = {
     "Safe Corridor":         1.0,
 }
 
+# ─── AQI Forecast (ARIMA-lite per zone) ──────────────────────────────────────
+# Stores last 12 AQI readings per zone (12 × 30s = 6 minutes of history)
+_aqi_history: dict = {z: deque(maxlen=12) for z in ALL_ZONES}
+
+def _forecast_aqi(zone: str, current_aqi: float) -> float:
+    """
+    Simple AR(3) forecast: predicts next AQI from last 3 readings.
+    Falls back to current value if insufficient history.
+    Uses least-squares AR coefficients — no external library needed.
+    """
+    hist = _aqi_history[zone]
+    hist.append(current_aqi)
+
+    n = len(hist)
+    if n < 4:
+        return current_aqi   # not enough history yet
+
+    # Build AR(3) design matrix
+    y = np.array(list(hist), dtype=float)
+    p = 3
+    X = np.column_stack([y[i:n-p+i] for i in range(p)])
+    y_target = y[p:]
+
+    try:
+        # Least-squares fit: coefficients for AR(3)
+        coeffs, _, _, _ = np.linalg.lstsq(X, y_target, rcond=None)
+        forecast = float(np.dot(coeffs, y[-p:]))
+        # Clip to reasonable AQI range
+        return round(max(0.0, min(500.0, forecast)), 1)
+    except Exception:
+        return current_aqi
+    
 def get_r():
     return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0,
                        socket_timeout=5, decode_responses=True)
@@ -38,7 +72,8 @@ def get_r():
 def _synthetic_score(zone):
     base = {"MN":0.38,"BK":0.52,"QN":0.64,"BX":0.44,"SI":0.76}.get(zone[:2], 0.5)
     rng  = random.Random(hash(zone) & 0xFFFF)
-    aqi  = rng.uniform(30, 175)
+    # AQI range 50–200 so ~half of zones cross HIGH_AQI=100 and exposure accumulates
+    aqi  = rng.uniform(50, 200)
     spd  = rng.uniform(12, 68)
     ss   = min(1.0, spd / 40.0)
     aq   = min(1.0, aqi / 100.0)
@@ -65,20 +100,33 @@ def read_zone_scores(r):
             try: scores[z] = json.loads(raw); real += 1; continue
             except: pass
         scores[z] = _synthetic_score(z)
-    if real: log.info("Zone scores: %d from Spark + %d synthetic", real, len(ALL_ZONES)-real)
+    log.info("Zone scores: %d from Spark + %d synthetic", real, len(ALL_ZONES)-real)
     return scores
+
+def _load_kmeans_labels():
+    """Load cluster labels from saved KMeans model file."""
+    import os
+    labels_path = os.path.join(os.path.dirname(__file__), "models", "cluster_labels.json")
+    try:
+        with open(labels_path) as f:
+            return json.load(f).get("zone_labels", {})
+    except Exception:
+        return {}
+
+_KMEANS_LABELS = _load_kmeans_labels()
 
 def read_cluster_labels(r):
     pipe = r.pipeline()
     for z in ALL_ZONES: pipe.get(f"cluster:{z}")
     results = pipe.execute()
-    return {z: (lbl or _synthetic_cluster(z)) for z, lbl in zip(ALL_ZONES, results)}
+    return {z: (lbl or _KMEANS_LABELS.get(z) or _synthetic_cluster(z))
+            for z, lbl in zip(ALL_ZONES, results)}
 
 def update_exposure(r, zone_scores):
     """Add RUN_INTERVAL seconds of exposure for every worker. Persist in Redis."""
-    mins_this_cycle = RUN_INTERVAL / 60.0 * 20
+    mins_this_cycle = RUN_INTERVAL / 60.0 * 5   # 5x speed: each 30s = 2.5 min exposure
 
-    # Read current worker zones (from Spark or stable fallback)
+    # Read current worker zones — try Spark key first, then recommender fallback
     pipe = r.pipeline()
     for i in range(1, NUM_WORKERS+1): pipe.get(f"worker_zone:W-{i:02d}")
     zone_results = pipe.execute()
@@ -91,9 +139,10 @@ def update_exposure(r, zone_scores):
         fallback = ALL_ZONES[(hash(wid + str(slot))) % len(ALL_ZONES)]
         worker_zones[wid] = z if (z and z in ALL_ZONES) else fallback
 
-    # Read existing exposure
+    # Read existing exposure — use rec_exposure: (recommender-owned) key
+    # This is separate from exposure: written by Spark so they never collide
     pipe = r.pipeline()
-    for i in range(1, NUM_WORKERS+1): pipe.get(f"exposure:W-{i:02d}")
+    for i in range(1, NUM_WORKERS+1): pipe.get(f"rec_exposure:W-{i:02d}")
     exp_results = pipe.execute()
 
     updated = {}
@@ -106,18 +155,22 @@ def update_exposure(r, zone_scores):
             except: pass
 
         zone    = worker_zones[wid]
-        aqi     = float(zone_scores.get(zone, {}).get("avg_aqi", 50.0))
-        h_mins  = float(prev.get("high_aqi_minutes", 0.0) or prev.get("hours_in_high_aqi", 0.0) * 60.0)
-        t_mins  = float(prev.get("total_minutes",    0.0))
-        aqi_sum = float(prev.get("aqi_sum",          0.0))
-
-        h_mins  += (mins_this_cycle if aqi > HIGH_AQI else 0)
+        current_aqi  = float(zone_scores.get(zone, {}).get("avg_aqi", 50.0))
+        forecast_aqi = _forecast_aqi(zone, current_aqi)
+        # Use the higher of current vs forecast — protective routing
+        aqi = max(current_aqi, forecast_aqi)
+        # Clean accumulation — prev is always our own rec_exposure: key
+        h_mins   = float(prev.get("high_aqi_minutes") or 0.0)
+        t_mins   = float(prev.get("total_minutes")    or 0.0)
+        aqi_sum  = float(prev.get("aqi_sum")          or 0.0)
+        n_cycles = int(prev.get("n_cycles")           or 0)
+        h_mins  += (mins_this_cycle if aqi > HIGH_AQI else mins_this_cycle * 0.1)  # 10% baseline even in clean zones
         t_mins  += mins_this_cycle
         aqi_sum += aqi
+        n_cycles += 1
 
-        hrs_high  = h_mins / 60.0
-        n_windows = max(1, t_mins / mins_this_cycle)
-        avg_aqi   = aqi_sum / n_windows
+        hrs_high = h_mins / 60.0
+        avg_aqi  = aqi_sum / n_cycles
         status    = ("CRITICAL" if hrs_high > CRIT_HRS
                      else "WARNING" if hrs_high > WARN_HRS else "SAFE")
 
@@ -127,13 +180,15 @@ def update_exposure(r, zone_scores):
             "high_aqi_minutes":  round(h_mins, 3),
             "total_minutes":     round(t_mins, 3),
             "aqi_sum":           round(aqi_sum, 1),
+            "n_cycles":          n_cycles,
             "hours_in_high_aqi": round(hrs_high, 3),
             "daily_avg_aqi":     round(avg_aqi, 1),
             "exposure_status":   status,
             "who_pct":           round(min(100, hrs_high / 8.0 * 100), 1),
+            "forecast_aqi":      forecast_aqi,
         }
         updated[wid] = rec
-        pipe.set(f"exposure:{wid}", json.dumps(rec), ex=86400)
+        pipe.set(f"rec_exposure:{wid}", json.dumps(rec), ex=86400)
     pipe.execute()
     return updated, worker_zones
 
@@ -162,6 +217,11 @@ def recommend(wid, exp, final_scores, cluster_labels, zone):
 def run_once(r):
     zone_scores    = read_zone_scores(r)
     cluster_labels = read_cluster_labels(r)
+
+    # ── AR(3) forecast: update per-zone history, replace raw AQI with forecast
+    for zone, data in zone_scores.items():
+        data["avg_aqi"] = _forecast_aqi(zone, data.get("avg_aqi", 50.0))
+
     worker_exp, worker_zones = update_exposure(r, zone_scores)
 
     final_scores = {z: round(zone_scores[z]["zone_score"] *
