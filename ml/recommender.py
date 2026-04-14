@@ -18,10 +18,11 @@ log = logging.getLogger(__name__)
 REDIS_HOST   = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT   = int(os.getenv("REDIS_PORT", "6379"))
 RUN_INTERVAL = int(os.getenv("RUN_INTERVAL", "30"))
-NUM_WORKERS  = 50
-HIGH_AQI     = 40.0
-WARN_HRS     = 0.3   # WARNING after ~15 min of demo runtime
-CRIT_HRS     = 0.6   # CRITICAL after ~30 min of demo runtime
+NUM_WORKERS   = 50
+HIGH_AQI      = 100.0  # WHO AQI threshold — unhealthy for sensitive groups
+WHO_DAILY_HRS = 8.0    # WHO: no more than 8h/day above AQI 100
+WARN_HRS      = 1.5    # WARNING after 1.5h in high-AQI zone
+CRIT_HRS      = 3.0    # CRITICAL after 3h  in high-AQI zone
 
 ALL_ZONES = [f"{p}-{i:02d}" for p in ["MN","BK","QN","BX","SI"] for i in range(1,7)]
 
@@ -164,7 +165,7 @@ def update_exposure(r, zone_scores):
         t_mins   = float(prev.get("total_minutes")    or 0.0)
         aqi_sum  = float(prev.get("aqi_sum")          or 0.0)
         n_cycles = int(prev.get("n_cycles")           or 0)
-        h_mins  += (mins_this_cycle if aqi > HIGH_AQI else mins_this_cycle * 0.1)  # 10% baseline even in clean zones
+        h_mins += (mins_this_cycle if aqi > HIGH_AQI else 0.0)
         t_mins  += mins_this_cycle
         aqi_sum += aqi
         n_cycles += 1
@@ -184,7 +185,7 @@ def update_exposure(r, zone_scores):
             "hours_in_high_aqi": round(hrs_high, 3),
             "daily_avg_aqi":     round(avg_aqi, 1),
             "exposure_status":   status,
-            "who_pct":           round(min(100, hrs_high / 8.0 * 100), 1),
+            "who_pct":           round(min(100, hrs_high / WHO_DAILY_HRS * 100), 1),
             "forecast_aqi":      forecast_aqi,
         }
         updated[wid] = rec
@@ -207,11 +208,12 @@ def recommend(wid, exp, final_scores, cluster_labels, zone):
     else:
         rz, rs = ranked[0]
         reason = f"Best available zone (score {rs:.2f})"
-    return {"worker_id":wid,"current_zone":zone,"rec_zone":rz,
+    return {"worker_id":wid,"zone_id":zone,"current_zone":zone,"rec_zone":rz,
             "rec_label":cluster_labels.get(rz,""),"rec_score":rs,
-            "status":status,"reason":reason,
+            "status":status,"exposure_status":status,"reason":reason,
             "hours_in_high_aqi":round(hours,2),
             "daily_avg_aqi":round(exp.get("daily_avg_aqi",50),1),
+            "who_pct":round(min(100, hours / WHO_DAILY_HRS * 100), 1),
             "ts":datetime.now(timezone.utc).isoformat()}
 
 def run_once(r):

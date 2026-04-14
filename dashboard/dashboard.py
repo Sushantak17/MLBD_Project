@@ -229,7 +229,10 @@ def status_counts():
 def perf_data():
     r=get_redis(); total=0; hist=[]
     if r:
-        try: total=int(r.get("perf_total_records") or 0)
+        try:
+            _tr = r.get("perf_total_records")
+            if _tr:
+                total = int(_tr.decode() if isinstance(_tr, bytes) else _tr)
         except: pass
         try:
             for raw in r.lrange("perf_history",-15,-1):
@@ -242,7 +245,7 @@ def perf_data():
             hist.append({"ts":f"{10+i//2:02d}:{(i%2)*30:02d}",
                 "rps":round(200+50*math.sin(i)+(i*3)),"lag_ms":round(80+20*math.sin(i*1.3)),
                 "storage_mb":round(20+i*6.5)})
-    if not total: total=random.randint(500000,2500000)
+    # total stays 0 if Redis has no value — no random fallback
     return {"total":total,"hist":hist}
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -331,7 +334,7 @@ with t1:
             st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
 
     with col_side:
-        st.markdown('<div class="slabel">Score Legend</div>', unsafe_allow_html=True)
+        st.markdown('<div class="slabel">Zone Score (dot colour)</div>', unsafe_allow_html=True)
         for color,label in [("#10B981","Score > 0.7 — Good"),("#F59E0B","0.4–0.7 — Moderate"),("#EF4444","< 0.4 — Poor")]:
             st.markdown(f"""<div style="display:flex;align-items:center;gap:8px;
               font-size:.78rem;color:#374151;margin-bottom:8px">
@@ -340,7 +343,7 @@ with t1:
         st.markdown('<br><div class="slabel">Event Breakdown</div>', unsafe_allow_html=True)
         for label,count,color in [("Normal",evt["NORMAL"],"#10B981"),
             ("Congestion",evt["CONGESTION_EVENT"],"#F59E0B"),
-            ("Pollution",evt["POLLUTION_ALERT"],"#F97316"),
+            ("Pollution",evt["POLLUTION_ALERT"],"#F59E0B"),
             ("Compound",evt["COMPOUND_EVENT"],"#EF4444")]:
             st.markdown(f"""<div style="display:flex;justify-content:space-between;
               align-items:center;padding:7px 10px;background:#fff;border:1px solid #F3F4F6;
@@ -362,11 +365,11 @@ with t2:
     st.markdown(f"""
     <div class="kpi-grid">
       <div class="kpi" style="--c:#10B981"><div class="kpi-label">Safe Workers</div>
-        <div class="kpi-val">{sc2.get('SAFE',0)}</div><div class="kpi-sub">Below 2h in high-AQI</div></div>
+        <div class="kpi-val">{sc2.get('SAFE',0)}</div><div class="kpi-sub">Below 1.5h in high-AQI</div></div>
       <div class="kpi" style="--c:#F59E0B"><div class="kpi-label">Warning</div>
-        <div class="kpi-val">{sc2.get('WARNING',0)}</div><div class="kpi-sub">2 to 3.5h in high-AQI</div></div>
+        <div class="kpi-val">{sc2.get('WARNING',0)}</div><div class="kpi-sub">1.5 to 3h in high-AQI</div></div>
       <div class="kpi" style="--c:#EF4444"><div class="kpi-label">Critical</div>
-        <div class="kpi-val">{sc2.get('CRITICAL',0)}</div><div class="kpi-sub">Over 3.5h in high-AQI</div></div>
+        <div class="kpi-val">{sc2.get('CRITICAL',0)}</div><div class="kpi-sub">Over 3h in high-AQI</div></div>
       <div class="kpi" style="--c:#3B82F6"><div class="kpi-label">Total Active</div>
         <div class="kpi-val">50</div><div class="kpi-sub">Across 30 zones</div></div>
     </div>""", unsafe_allow_html=True)
@@ -377,7 +380,7 @@ with t2:
     for w in ww_sorted:
         st2=w.get("exposure_status","SAFE"); hrs=w.get("hours_in_high_aqi",0.0)
         aqi=w.get("daily_avg_aqi",50.0); zone=w.get("zone_id","–")
-        pct=min(100,hrs/4.5*100); who=w.get("who_pct",0)
+        pct=min(100,hrs/4.5*100); who=min(100,round(hrs/3.0*100,1))
         bc={"SAFE":"#10B981","WARNING":"#F59E0B","CRITICAL":"#EF4444"}.get(st2,"#9CA3AF")
         bclass={"SAFE":"bs","WARNING":"bw","CRITICAL":"bc"}.get(st2,"bn")
         rows_html+=f"""<tr>
@@ -395,7 +398,7 @@ with t2:
     <div class="slabel">All 50 Workers — Sorted by Exposure Risk</div>
     <table class="wtbl"><thead><tr>
       <th>Worker</th><th>Zone</th><th>Borough</th>
-      <th>Hours in High AQI</th><th>Avg AQI</th><th>WHO Daily Limit</th><th>Status</th>
+      <th>Hours in High AQI</th><th>Avg AQI</th><th>% of 3h Limit</th><th>Status</th>
     </tr></thead><tbody>{rows_html}</tbody></table>""", unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -481,7 +484,11 @@ with t4:
     # ── ML Model Info Panel ───────────────────────────────────────────────────
     r2 = get_redis()
     skm_batches = int(r2.get("skm_batch_count") or 0) if r2 else 0
-    skm_inertia = float(r2.get("skm_inertia") or 0.0) if r2 else 0.0
+    try:
+        _raw_inertia = r2.get("skm_inertia") if r2 else None
+        skm_inertia = float(_raw_inertia) if _raw_inertia and _raw_inertia not in ("inf","nan","Inf") else 0.0
+    except (ValueError, TypeError):
+        skm_inertia = 0.0
     sil_score, n_feat, offline_zones = "N/A", 7, 0
     try:
         import json as _j

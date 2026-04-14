@@ -158,31 +158,32 @@ docker compose logs redis         # Cache
 
 ## Step 4 – Run the Kafka Producers
 
-Open 4 terminal windows and run each producer:
+All 4 producers (traffic, pollution, weather, workers) are bundled into one script
+that runs them as parallel threads:
 
 ```bash
-# Terminal 1 – Traffic (100 rows/sec default)
 cd urbanstream/
-KAFKA_BROKER=localhost:9092 REPLAY_SPEED=100 python3 producers/traffic_producer.py
-
-# Terminal 2 – Pollution (50 rows/sec default)
-cd urbanstream/
-KAFKA_BROKER=localhost:9092 REPLAY_SPEED=50 python3 producers/pollution_producer.py
-
-# Terminal 3 – Weather (10 rows/sec default)
-cd urbanstream/
-KAFKA_BROKER=localhost:9092 REPLAY_SPEED=10 python3 producers/weather_producer.py
-
-# Terminal 4 – Workers (simulated, no CSV needed)
-cd urbanstream/
-KAFKA_BROKER=localhost:9092 python3 producers/worker_producer.py
+KAFKA_BROKER=localhost:9092 python3 producers/run_all_producers.py
 ```
 
-**Speed up for throughput testing:**
+**Speed up for throughput testing** (set env vars before running):
 ```bash
-REPLAY_SPEED=500 python3 producers/traffic_producer.py   # 500 ev/sec
-REPLAY_SPEED=1000 python3 producers/traffic_producer.py  # 1000 ev/sec
+KAFKA_BROKER=localhost:9092 TRAFFIC_SPEED=500 POLLUTION_SPEED=200 \
+  python3 producers/run_all_producers.py   # 500 traffic + 200 pollution ev/sec
+
+KAFKA_BROKER=localhost:9092 TRAFFIC_SPEED=1000 \
+  python3 producers/run_all_producers.py   # 1000 traffic ev/sec
 ```
+
+Available environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `TRAFFIC_SPEED` | 500 | Traffic rows/sec |
+| `POLLUTION_SPEED` | 200 | Pollution rows/sec |
+| `WEATHER_SPEED` | 10 | Weather rows/sec |
+| `NUM_WORKERS` | 50 | Simulated gig workers |
+| `MOVE_INTERVAL` | 30 | Seconds between worker zone changes |
 
 ---
 
@@ -191,12 +192,18 @@ REPLAY_SPEED=1000 python3 producers/traffic_producer.py  # 1000 ev/sec
 ```bash
 docker exec urbanstream-spark-master /opt/spark/bin/spark-submit \
   --master spark://spark-master:7077 \
-  --packages \
-    org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,\
-    org.apache.hadoop:hadoop-aws:3.3.4,\
-    com.amazonaws:aws-java-sdk-bundle:1.12.367 \
+  --executor-cores 2 \
+  --executor-memory 1g \
+  --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.367 \
+  --py-files /opt/spark/jobs/streaming_kmeans.py \
   --conf spark.sql.shuffle.partitions=8 \
   --conf spark.executor.memory=1g \
+  --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
+  --conf spark.hadoop.fs.s3a.access.key=minioadmin \
+  --conf spark.hadoop.fs.s3a.secret.key=minioadmin \
+  --conf spark.hadoop.fs.s3a.path.style.access=true \
+  --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+  --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false \
   /opt/spark/jobs/stream_processor.py
 ```
 
@@ -207,16 +214,18 @@ Watch the Spark UI at http://localhost:8888 to see active streaming queries.
 ## Step 6 – Run ML Jobs (Optional, enhances dashboard)
 
 ```bash
-# Clustering (run hourly; can be added to cron)
-docker exec urbanstream-spark-master /opt/spark/bin/spark-submit \
-  --packages \
-    org.apache.hadoop:hadoop-aws:3.3.4,\
-    com.amazonaws:aws-java-sdk-bundle:1.12.367 \
-  /opt/spark/jobs/../ml/clustering.py
+# Train offline KMeans and save model artefacts (run once, or hourly via cron)
+python3 ml/clustering.py
 
-# Recommender (run every 30 seconds)
+# Evaluate the model — produces elbow, silhouette, PCA and centroid plots
+jupyter notebook ml/clustering_evaluation.ipynb
+
+# Recommender (run every 30 seconds alongside Spark)
 REDIS_HOST=localhost python3 ml/recommender.py
 ```
+
+Plots are saved to `ml/models/` automatically when the notebook runs:
+`elbow_silhouette.png`, `silhouette_plot.png`, `pca_scatter.png`, `centroid_profiles.png`, `cluster_composition.png`
 
 ---
 
@@ -255,15 +264,13 @@ urbanstream/
 │   ├── openaq_nyc.csv      ← Download per Step 1
 │   └── weather_nyc.csv     ← Download per Step 1
 ├── producers/
-│   ├── traffic_producer.py  ← 100 rows/sec → traffic_stream
-│   ├── pollution_producer.py← 50 rows/sec  → pollution_stream
-│   ├── weather_producer.py  ← 10 rows/sec  → weather_stream
-│   └── worker_producer.py   ← 50 simulated workers → worker_stream
+│   └── run_all_producers.py ← All 4 producers as threads (traffic/pollution/weather/workers)
 ├── spark/
 │   └── stream_processor.py  ← Main Spark job (5 streaming queries)
 ├── ml/
-│   ├── clustering.py        ← Hourly KMeans clustering
-│   └── recommender.py       ← 30s recommendation loop
+│   ├── clustering.py              ← Hourly KMeans clustering
+│   ├── clustering_evaluation.ipynb← Elbow, silhouette, PCA, centroid analysis
+│   └── recommender.py             ← 30s recommendation loop
 └── dashboard/
     └── dashboard.py         ← Streamlit 5-tab dashboard
 ```

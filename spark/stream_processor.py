@@ -18,17 +18,17 @@ from pyspark.sql.types import DoubleType, StringType, StructField, StructType
 
 # ── Config ────────────────────────────────────────────────────────────────────
 KAFKA_BROKER    = os.getenv("KAFKA_BROKER",    "redpanda:9092")
-CHECKPOINT_BASE = os.getenv("CHECKPOINT_BASE", "/tmp/urbanstream/checkpoints")
-DATALAKE_BASE   = os.getenv("DATALAKE_BASE",   "/tmp/urbanstream/datalake")
+CHECKPOINT_BASE = os.getenv("CHECKPOINT_BASE", "s3a://checkpoints/urbanstream")
+DATALAKE_BASE   = os.getenv("DATALAKE_BASE",   "s3a://datalake/urbanstream")
 WATERMARK       = os.getenv("WATERMARK",       "2 minutes")
 REDIS_HOST      = os.getenv("REDIS_HOST",      "redis")
 BASELINE_SPEED  = 40.0
 K               = 4      # number of clusters
 
 # Exposure thresholds — tune these to control demo speed
-HIGH_AQI  = float(os.getenv("HIGH_AQI",   "40.0"))  # AQI above this counts as "high"
-WARN_HRS  = float(os.getenv("WARN_HRS",   "0.3"))   # hours in high-AQI → WARNING
-CRIT_HRS  = float(os.getenv("CRIT_HRS",   "0.6"))   # hours in high-AQI → CRITICAL
+HIGH_AQI  = float(os.getenv("HIGH_AQI",   "100.0")) # WHO threshold — unhealthy for sensitive groups
+WARN_HRS  = float(os.getenv("WARN_HRS",   "1.5"))   # hours in high-AQI → WARNING
+CRIT_HRS  = float(os.getenv("CRIT_HRS",   "3.0"))   # hours in high-AQI → CRITICAL
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [STREAM-PROCESSOR] %(levelname)s %(message)s")
@@ -110,12 +110,7 @@ _total     = [0]
 #   • Inertia (sum of squared distances to nearest centroid) is computed
 #     and logged so you can watch the model converge over time
 
-CLUSTER_NAMES = [
-    "Permanently Hazardous",   # rank 0 → highest hazard
-    "Peak Hour Hazardous",     # rank 1
-    "Weather Sensitive",       # rank 2
-    "Safe Corridor",           # rank 3 → lowest hazard
-]
+from streaming_kmeans import StreamingKMeans, CLUSTER_NAMES  # testable without Spark
 
 # Borough density proxy (population density index 0-1)
 BOROUGH_DENSITY = {"MN": 1.0, "BK": 0.75, "QN": 0.60, "BX": 0.55, "SI": 0.30}
@@ -269,6 +264,46 @@ class StreamingKMeans:
 # Singleton model — persists across all foreachBatch calls in this JVM process
 _skm = StreamingKMeans(k=K)
 
+# ── Centroid persistence helpers ──────────────────────────────────────────────
+_SKM_CENTROID_KEY = "skm_centroids"
+
+def _restore_centroids_from_redis() -> None:
+    """Reload centroid state saved by a previous Spark run so partial_fit
+    continues from where it left off instead of reinitialising."""
+    if not _redis:
+        return
+    try:
+        raw = _redis.get(_SKM_CENTROID_KEY)
+        if not raw:
+            return
+        state = json.loads(raw)
+        _skm.centroids  = state["centroids"]
+        _skm.counts     = state["counts"]
+        _skm.n_batches  = state["n_batches"]
+        _skm._feat_min  = state["feat_min"]
+        _skm._feat_max  = state["feat_max"]
+        log.info("[SKM] Restored centroids from Redis (batch #%d)", _skm.n_batches)
+    except Exception as e:
+        log.warning("[SKM] Centroid restore skipped: %s", e)
+
+def _save_centroids_to_redis() -> None:
+    """Persist current centroid state to Redis so restarts are warm."""
+    if not _redis or _skm.centroids is None:
+        return
+    try:
+        state = {
+            "centroids": _skm.centroids,
+            "counts":    _skm.counts,
+            "n_batches": _skm.n_batches,
+            "feat_min":  _skm._feat_min,
+            "feat_max":  _skm._feat_max,
+        }
+        _redis.set(_SKM_CENTROID_KEY, json.dumps(state), ex=86400)
+    except Exception as e:
+        log.warning("[SKM] Centroid save skipped: %s", e)
+
+_restore_centroids_from_redis()
+
 def _warmstart_clusters_from_file() -> None:
     """Push offline KMeans labels to Redis on startup so dashboard
     has real cluster data from batch 0, not synthetic fallback."""
@@ -325,9 +360,11 @@ def _retrain_and_push_clusters(batch_id: int) -> None:
             pipe = _redis.pipeline()
             for z, name in zone_clusters.items():
                 pipe.set(f"cluster:{z}", name, ex=300)
-            pipe.set("skm_batch_count", _skm.n_batches,  ex=3600)
-            pipe.set("skm_inertia",     round(_skm.inertia, 4), ex=3600)
+            _inertia = round(_skm.inertia, 4) if _skm.inertia != float("inf") else 0.0
+            pipe.set("skm_batch_count", _skm.n_batches, ex=86400)
+            pipe.set("skm_inertia",     _inertia,        ex=86400)
             pipe.execute()
+            _save_centroids_to_redis()   # persist so restarts are warm
         except Exception as e:
             log.warning("[SKM] Redis push failed: %s", e)
 
@@ -387,12 +424,17 @@ def _push_zone_scores(batch_id: int) -> None:
     log.info("[ZONE_SCORES] Batch #%d | %d zones | pushed to Redis", batch_id, len(scores))
 
     try:
-        d = f"{DATALAKE_BASE}/zone_scores/batch_{batch_id:06d}"
-        os.makedirs(d, exist_ok=True)
-        with open(f"{d}/data.json","w") as f:
-            json.dump(scores, f)
-    except Exception:
-        pass
+        from pyspark.sql import SparkSession
+        spark = SparkSession.getActiveSession()
+        if spark and scores:
+            path = f"{DATALAKE_BASE}/zone_scores/batch_{batch_id:06d}"
+            (spark.createDataFrame(scores)
+                  .coalesce(1)
+                  .write.mode("overwrite")
+                  .json(path))
+            log.info("[DATALAKE] Batch #%d written to %s", batch_id, path)
+    except Exception as e:
+        log.warning("[DATALAKE] Write failed: %s", e)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -535,7 +577,7 @@ def handle_metrics(df: DataFrame, batch_id: int):
              batch_id, count, _total[0])
     if _redis:
         try:
-            _redis.set("perf_total_records", _total[0], ex=3600)
+            _redis.set("perf_total_records", _total[0], ex=86400)
             entry = json.dumps({"ts":         datetime.now().strftime("%H:%M"),
                                 "rps":        count,
                                 "lag_ms":     50,
@@ -552,10 +594,22 @@ def handle_metrics(df: DataFrame, batch_id: int):
 # ═════════════════════════════════════════════════════════════════════════════
 
 def create_spark():
+    minio_endpoint = os.getenv("MINIO_ENDPOINT",       "http://minio:9000")
+    minio_user     = os.getenv("MINIO_ROOT_USER",      "minioadmin")
+    minio_password = os.getenv("MINIO_ROOT_PASSWORD",  "minioadmin")
+
     return (SparkSession.builder
             .appName("UrbanStream-v4")
-            .config("spark.sql.shuffle.partitions", "4")
+            .config("spark.sql.shuffle.partitions", "8")
             .config("spark.streaming.stopGracefullyOnShutdown", "true")
+            # ── S3A / MinIO ──────────────────────────────────────────────────
+            .config("spark.hadoop.fs.s3a.endpoint",               minio_endpoint)
+            .config("spark.hadoop.fs.s3a.access.key",             minio_user)
+            .config("spark.hadoop.fs.s3a.secret.key",             minio_password)
+            .config("spark.hadoop.fs.s3a.path.style.access",      "true")
+            .config("spark.hadoop.fs.s3a.impl",
+                    "org.apache.hadoop.fs.s3a.S3AFileSystem")
+            .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
             .getOrCreate())
 
 
@@ -568,8 +622,8 @@ def main():
     spark = create_spark()
     spark.sparkContext.setLogLevel("WARN")
 
-    os.makedirs(CHECKPOINT_BASE, exist_ok=True)
-    os.makedirs(DATALAKE_BASE,   exist_ok=True)
+    log.info("Datalake  → %s", DATALAKE_BASE)
+    log.info("Checkpoints → %s", CHECKPOINT_BASE)
 
     traffic_raw   = read_kafka(spark, "traffic_stream",   TRAFFIC_SCHEMA)
     pollution_raw = read_kafka(spark, "pollution_stream", POLLUTION_SCHEMA)

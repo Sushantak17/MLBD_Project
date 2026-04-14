@@ -94,11 +94,21 @@ services:
       - SPARK_MASTER_HOST=0.0.0.0
       - SPARK_MASTER_PORT=7077
       - SPARK_MASTER_WEBUI_PORT=8080
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      - REDIS_HOST=redis
+      - KAFKA_BROKER=redpanda:9092
     entrypoint: ["/opt/spark/sbin/start-master.sh"]
     command: []
     volumes:
       - ./spark:/opt/spark/jobs
       - spark_logs:/opt/spark/logs
+    depends_on:
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8080 > /dev/null"]
       interval: 15s
@@ -118,6 +128,11 @@ services:
       - SPARK_WORKER_WEBUI_PORT=8081
       - SPARK_WORKER_MEMORY=2g
       - SPARK_WORKER_CORES=2
+      - MINIO_ENDPOINT=http://minio:9000
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+      - REDIS_HOST=redis
+      - KAFKA_BROKER=redpanda:9092
       - SPARK_MASTER_URL=spark://spark-master:7077
     entrypoint: ["/opt/spark/sbin/start-worker.sh"]
     command: ["spark://spark-master:7077"]
