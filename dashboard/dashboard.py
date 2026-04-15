@@ -231,8 +231,7 @@ def perf_data():
     if r:
         try:
             _tr = r.get("perf_total_records")
-            if _tr:
-                total = int(_tr.decode() if isinstance(_tr, bytes) else _tr)
+            if _tr: total = int(_tr)
         except: pass
         try:
             for raw in r.lrange("perf_history",-15,-1):
@@ -335,6 +334,7 @@ with t1:
 
     with col_side:
         st.markdown('<div class="slabel">Zone Score (dot colour)</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:.7rem;color:#9CA3AF;margin-bottom:8px">Speed + air quality combined</div>', unsafe_allow_html=True)
         for color,label in [("#10B981","Score > 0.7 — Good"),("#F59E0B","0.4–0.7 — Moderate"),("#EF4444","< 0.4 — Poor")]:
             st.markdown(f"""<div style="display:flex;align-items:center;gap:8px;
               font-size:.78rem;color:#374151;margin-bottom:8px">

@@ -35,15 +35,27 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 # ── Redis ─────────────────────────────────────────────────────────────────────
-try:
+def _init_redis():
+    """Try both the configured REDIS_HOST and localhost fallback."""
     import redis as _rl
-    _redis = _rl.Redis(host=REDIS_HOST, port=6379, db=0,
-                       socket_timeout=2, decode_responses=True)
-    _redis.ping()
-    log.info("Redis connected at %s:6379", REDIS_HOST)
-except Exception as e:
-    _redis = None
-    log.warning("Redis unavailable: %s", e)
+    hosts = [REDIS_HOST]
+    if REDIS_HOST != "localhost":
+        hosts.append("localhost")
+    if REDIS_HOST != "redis":
+        hosts.append("redis")
+    for host in hosts:
+        try:
+            r = _rl.Redis(host=host, port=6379, db=0,
+                          socket_timeout=3, decode_responses=True)
+            r.ping()
+            log.info("Redis connected at %s:6379", host)
+            return r
+        except Exception as e:
+            log.warning("Redis not available at %s: %s", host, e)
+    log.warning("Redis unavailable on all hosts — metrics will not be stored")
+    return None
+
+_redis = _init_redis()
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 TRAFFIC_SCHEMA = StructType([
@@ -475,6 +487,9 @@ def handle_traffic(df: DataFrame, batch_id: int):
     _total[0] += len(rows)
     log.info("[TRAFFIC] Batch #%d | %d rows | %d zones | total %d",
              batch_id, len(rows), len(zone_data), _total[0])
+    if _redis:
+        try: _redis.set("perf_total_records", _total[0], ex=86400)
+        except Exception: pass
     # ── retrain streaming KMeans every traffic batch ──────────────────────────
     _retrain_and_push_clusters(batch_id)
     _push_zone_scores(batch_id)
