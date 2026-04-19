@@ -8,7 +8,8 @@
 ## Architecture Overview
 
 ```
-NYC Open Data CSVs
+NYC Open Data CSVs & 
+OPENAQ API(Realtime)
         │
         ▼
   ┌─────────────┐     ┌──────────────────────┐     ┌──────────────┐

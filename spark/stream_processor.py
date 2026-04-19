@@ -35,27 +35,15 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 # ── Redis ─────────────────────────────────────────────────────────────────────
-def _init_redis():
-    """Try both the configured REDIS_HOST and localhost fallback."""
+try:
     import redis as _rl
-    hosts = [REDIS_HOST]
-    if REDIS_HOST != "localhost":
-        hosts.append("localhost")
-    if REDIS_HOST != "redis":
-        hosts.append("redis")
-    for host in hosts:
-        try:
-            r = _rl.Redis(host=host, port=6379, db=0,
-                          socket_timeout=3, decode_responses=True)
-            r.ping()
-            log.info("Redis connected at %s:6379", host)
-            return r
-        except Exception as e:
-            log.warning("Redis not available at %s: %s", host, e)
-    log.warning("Redis unavailable on all hosts — metrics will not be stored")
-    return None
-
-_redis = _init_redis()
+    _redis = _rl.Redis(host=REDIS_HOST, port=6379, db=0,
+                       socket_timeout=2, decode_responses=True)
+    _redis.ping()
+    log.info("Redis connected at %s:6379", REDIS_HOST)
+except Exception as e:
+    _redis = None
+    log.warning("Redis unavailable: %s", e)
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 TRAFFIC_SCHEMA = StructType([
@@ -410,7 +398,9 @@ def _push_zone_scores(batch_id: int) -> None:
         ss  = min(1.0, spd / BASELINE_SPEED)
         aq  = min(1.0, aqi / 100.0)
         zs  = round(ss * 0.5 + aq * 0.5, 3)
-        cong = spd < BASELINE_SPEED * 0.6; poll = aqi > 150
+        # Thresholds tuned to real data ranges (speed 30-57 km/h, AQI 33-50)
+        cong = spd < BASELINE_SPEED * 0.85   # < 34 km/h  → congestion
+        poll = aqi > 38                       # > 38 AQI   → pollution alert
         evt  = ("COMPOUND_EVENT"   if cong and poll else
                 "CONGESTION_EVENT" if cong else
                 "POLLUTION_ALERT"  if poll else "NORMAL")

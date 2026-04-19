@@ -168,24 +168,52 @@ def zone_scores():
     for z in ALL_ZONES:
         if z not in out:
             rng=_srng(z); aqi=rng.uniform(30,175); spd=rng.uniform(12,68)
-            out[z]={"zone_id":z,"zone_score":round((min(1,spd/40)*.5)+(min(1,aqi/100)*.5),3),
+            out[z]={"zone_id":z,"zone_score":round((min(1,spd/40)*.5)+(1-min(1,aqi/200))*.5, 3),
                     "avg_aqi":round(aqi,1),"avg_speed":round(spd,1),
-                    "event_type":rng.choice(["NORMAL","NORMAL","NORMAL","CONGESTION_EVENT","POLLUTION_ALERT"])}
+                    "event_type": (
+                    "COMPOUND_EVENT"   if spd < 25 and aqi > 100 else
+                    "CONGESTION_EVENT" if spd < 25 else
+                    "POLLUTION_ALERT"  if aqi > 100 else
+                    "NORMAL"
+                )}
     return out
 
+def _offline_kmeans_labels():
+    try:
+        path = os.path.join(os.path.dirname(__file__), "../ml/models/cluster_labels.json")
+        with open(path) as f:
+            return json.load(f).get("zone_labels", {})
+    except Exception:
+        return {}
+
 def cluster_labels():
-    r=get_redis(); out={}
+    r=get_redis(); streaming={}
     if r:
         pipe=r.pipeline()
         for z in ALL_ZONES: pipe.get(f"cluster:{z}")
         for z,v in zip(ALL_ZONES,pipe.execute()):
-            if v: out[z]=v
+            if v: streaming[z]=v
+
+    # Only use streaming labels when all 4 clusters are represented
+    # (streaming KMeans collapses to 1-2 clusters until it converges on
+    # low-variance data — offline KMeans always has all 4 properly)
+    active_clusters = set(streaming.values())
+    if len(active_clusters) >= 4:
+        return streaming
+
+    # Blend: streaming overrides offline only where streaming cluster
+    # differs meaningfully — for now just use offline as the base
+    offline = _offline_kmeans_labels()
+    if offline:
+        return {z: offline.get(z, streaming.get(z, "Safe Corridor")) for z in ALL_ZONES}
+
+    # Last resort: deterministic synthetic
+    out = {}
     for z in ALL_ZONES:
-        if z not in out:
-            rng=_srng(z); p=z[:2]
-            w={"MN":[20,30,30,20],"BK":[30,30,25,15],"QN":[40,30,20,10],
-               "BX":[20,25,30,25],"SI":[60,25,10,5]}.get(p,[25]*4)
-            out[z]=rng.choices(list(CLUSTER_META.keys()),weights=w)[0]
+        p = z[:2]
+        w = {"MN":[20,30,30,20],"BK":[30,30,25,15],"QN":[40,30,20,10],
+             "BX":[20,25,30,25],"SI":[60,25,10,5]}.get(p,[25]*4)
+        out[z] = _srng(z).choices(list(CLUSTER_META.keys()), weights=w)[0]
     return out
 
 def worker_data():
@@ -272,7 +300,13 @@ with t1:
     wpz={}
     for w in ww: wpz[w.get("zone_id","")]=wpz.get(w.get("zone_id",""),0)+1
     evt={"NORMAL":0,"CONGESTION_EVENT":0,"POLLUTION_ALERT":0,"COMPOUND_EVENT":0}
-    for s in zs.values(): evt[s.get("event_type","NORMAL")]+=1
+    for s in zs.values():
+        raw_evt = s.get("event_type") or "NORMAL"
+        if raw_evt == "CONGESTION":  raw_evt = "CONGESTION_EVENT"
+        if raw_evt == "POLLUTION":   raw_evt = "POLLUTION_ALERT"
+        if raw_evt == "COMPOUND":    raw_evt = "COMPOUND_EVENT"
+        if raw_evt not in evt:       raw_evt = "NORMAL"
+        evt[raw_evt] += 1
     avg_score=round(sum(s["zone_score"] for s in zs.values())/len(zs),3)
     avg_aqi=round(sum(s["avg_aqi"] for s in zs.values())/len(zs),1)
     active=evt["CONGESTION_EVENT"]+evt["POLLUTION_ALERT"]+evt["COMPOUND_EVENT"]
